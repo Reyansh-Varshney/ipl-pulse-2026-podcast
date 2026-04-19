@@ -86,7 +86,9 @@ def generate_script(news_data):
     - Prabhat (Analytical, deep insights)
     - Neerja (Expressive, energetic, fan perspective)
     
-    Return ONLY a JSON array of objects: [{{"speaker": "Prabhat", "text": "..."}}, {{"speaker": "Neerja", "text": "..."}}]
+    Return the response as a valid JSON array of objects. 
+    Each object MUST have 'speaker' and 'text' keys. 
+    Do NOT include Markdown blocks like ```json. Just the raw JSON.
     
     News Data: {json.dumps(news_data[:20])}
     """
@@ -137,26 +139,23 @@ def generate_with_google(prompt_text):
     """
     model = GOOGLE_MODEL
     api_key = GOOGLE_API_KEY
+    # Use v1beta for generateContent with gemini-3-flash
     endpoints = [
-        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
-        f"https://generativelanguage.googleapis.com/v1beta2/models/{model}:generateText?key={api_key}"
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     ]
 
-    # Try modern generateContent first, then legacy generateText
+    # Try modern generateContent first
     errors = []
     for endpoint in endpoints:
         try:
-            if ":generateContent" in endpoint:
-                payload = {
-                    "contents": [{"parts": [{"text": prompt_text}]}],
-                    "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2500}
+            payload = {
+                "contents": [{"role": "user", "parts": [{"text": prompt_text}]}],
+                "generationConfig": {
+                    "temperature": 0.2, 
+                    "maxOutputTokens": 8192,
+                    "response_mime_type": "application/json"
                 }
-            else:
-                payload = {
-                    "prompt": {"text": prompt_text},
-                    "temperature": 0.2,
-                    "maxOutputTokens": 2500
-                }
+            }
 
             r = requests.post(endpoint, json=payload, timeout=120)
             if r.status_code != 200:
