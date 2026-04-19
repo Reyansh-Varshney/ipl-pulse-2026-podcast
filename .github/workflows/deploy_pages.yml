@@ -28,6 +28,8 @@ jobs:
           pnpm install
 
       - name: Build
+        env:
+          NEXT_PUBLIC_GITHUB_REPO: ${{ vars.NEXT_PUBLIC_GITHUB_REPO || 'Reyansh-Varshney/ipl-pulse-2026-podcast' }}
         run: |
           pnpm build
 
