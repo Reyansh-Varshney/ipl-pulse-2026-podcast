@@ -6,15 +6,20 @@ import feedparser
 import requests
 from bs4 import BeautifulSoup
 from openai import OpenAI
+from dotenv import load_dotenv
 import edge_tts
 from pydub import AudioSegment
 from datetime import datetime
+
+load_dotenv()
 
 # --- CONFIGURATION ---
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 # Google API Key for Gemini 3 Flash (Google AI Studio / Generative API)
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
-GOOGLE_MODEL = os.environ.get("GOOGLE_MODEL", "gemini-3-flash")
+GOOGLE_MODEL = os.environ.get("GOOGLE_MODEL", "gemini-3-flash-preview")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 # OpenRouter free fallback models (tried in order)
 OPENROUTER_MODELS = [
     model.strip() for model in os.environ.get(
@@ -92,7 +97,20 @@ def generate_script(news_data):
             return generate_with_google(prompt)
         except Exception as e:
             print("Google generation failed:", e)
-            update_status("Scripting", 48, "Falling back to OpenRouter...")
+            update_status("Scripting", 48, "Falling back to Groq...")
+
+    # Fallback to Groq if available
+    if GROQ_API_KEY:
+        try:
+            update_status("Scripting", 50, f"Trying Groq fallback model: {GROQ_MODEL}")
+            client = OpenAI(
+                base_url="https://api.groq.com/openai/v1",
+                api_key=GROQ_API_KEY
+            )
+            return generate_with_openai_compatible(client, GROQ_MODEL, prompt)
+        except Exception as e:
+            print(f"Groq generation failed ({GROQ_MODEL}): {e}")
+            update_status("Scripting", 51, "Falling back to OpenRouter free models...")
 
     # Fallback to OpenRouter free models if available
     if OPENROUTER_API_KEY:
@@ -103,15 +121,7 @@ def generate_script(news_data):
         for model_name in OPENROUTER_MODELS:
             try:
                 update_status("Scripting", 52, f"Trying OpenRouter fallback model: {model_name}")
-                response = client.chat.completions.create(
-                    model=model_name,
-                    messages=[{"role": "user", "content": prompt}],
-                    stream=False
-                )
-                content = response.choices[0].message.content
-                if "```json" in content:
-                    content = content.split("```json")[1].split("```")[0]
-                return json.loads(content)
+                return generate_with_openai_compatible(client, model_name, prompt)
             except Exception as e:
                 print(f"OpenRouter model failed ({model_name}): {e}")
 
@@ -127,61 +137,70 @@ def generate_with_google(prompt_text):
     """
     model = GOOGLE_MODEL
     api_key = GOOGLE_API_KEY
-    endpoint = f"https://generativelanguage.googleapis.com/v1beta2/models/{model}:generateText?key={api_key}"
+    endpoints = [
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+        f"https://generativelanguage.googleapis.com/v1beta2/models/{model}:generateText?key={api_key}"
+    ]
 
-    payload = {
-        "prompt": {"text": prompt_text},
-        "temperature": 0.2,
-        "maxOutputTokens": 2500
-    }
-
-    # Attempt streaming request; if not supported, fall back to simple POST
-    with requests.post(endpoint, json=payload, stream=True, timeout=120) as r:
-        if r.status_code != 200:
-            # try to get json error
-            try:
-                err = r.json()
-            except Exception:
-                err = r.text
-            raise RuntimeError(f"Google API error: {err}")
-
-        # Handle SSE-like streaming if present
-        collected = ""
-        if r.headers.get('Content-Type', '').startswith('text/event-stream'):
-            for line in r.iter_lines(decode_unicode=True):
-                if not line:
-                    continue
-                if line.startswith('data: '):
-                    data = line.split('data: ', 1)[1]
-                else:
-                    data = line
-                # skip keep-alive
-                if data.strip() == '[DONE]':
-                    break
-                try:
-                    obj = json.loads(data)
-                    # try multiple common paths
-                    text_chunk = obj.get('response', {}).get('output', '') or obj.get('candidates', [{}])[0].get('content', '')
-                    if text_chunk:
-                        collected += text_chunk
-                except Exception:
-                    # if not json, append raw chunk
-                    collected += data
-        else:
-            # non-streaming JSON response
-            resp_json = r.json()
-            # common fields: 'candidates' with 'content' or 'output'
-            if 'candidates' in resp_json and len(resp_json['candidates']) > 0:
-                collected = resp_json['candidates'][0].get('content', '')
+    # Try modern generateContent first, then legacy generateText
+    errors = []
+    for endpoint in endpoints:
+        try:
+            if ":generateContent" in endpoint:
+                payload = {
+                    "contents": [{"parts": [{"text": prompt_text}]}],
+                    "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2500}
+                }
             else:
-                # fallback to stringified JSON
+                payload = {
+                    "prompt": {"text": prompt_text},
+                    "temperature": 0.2,
+                    "maxOutputTokens": 2500
+                }
+
+            r = requests.post(endpoint, json=payload, timeout=120)
+            if r.status_code != 200:
+                try:
+                    err = r.json()
+                except Exception:
+                    err = r.text
+                errors.append({"endpoint": endpoint, "error": err})
+                continue
+
+            resp_json = r.json()
+            collected = ""
+            if "candidates" in resp_json and len(resp_json["candidates"]) > 0:
+                candidate = resp_json["candidates"][0]
+                if isinstance(candidate.get("content"), dict):
+                    parts = candidate["content"].get("parts", [])
+                    collected = "".join([p.get("text", "") for p in parts if isinstance(p, dict)])
+                else:
+                    collected = candidate.get("content", "")
+            elif "text" in resp_json:
+                collected = resp_json.get("text", "")
+            else:
                 collected = json.dumps(resp_json)
 
-        # If model wrapped JSON in markdown, extract
-        if "```json" in collected:
-            collected = collected.split("```json")[1].split("```")[0]
+            if "```json" in collected:
+                collected = collected.split("```json")[1].split("```")[0]
 
-        return json.loads(collected)
+            return json.loads(collected)
+        except Exception as e:
+            errors.append({"endpoint": endpoint, "error": str(e)})
+
+    raise RuntimeError(f"Google API error: {errors}")
+
+
+def generate_with_openai_compatible(client, model_name, prompt_text):
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=[{"role": "user", "content": prompt_text}],
+        stream=False
+    )
+    content = response.choices[0].message.content
+    if "```json" in content:
+        content = content.split("```json")[1].split("```")[0]
+    return json.loads(content)
 
 async def render_audio_edge_tts(script):
     update_status("TTS Rendering", 70, "Rendering audio chunks with Edge-TTS...")
