@@ -15,8 +15,13 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 # Google API Key for Gemini 3 Flash (Google AI Studio / Generative API)
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 GOOGLE_MODEL = os.environ.get("GOOGLE_MODEL", "gemini-3-flash")
-MODEL = "google/gemma-4-31b-it:free"
-FALLBACK_MODEL = "google/gemini-pro"
+# OpenRouter free fallback models (tried in order)
+OPENROUTER_MODELS = [
+    model.strip() for model in os.environ.get(
+        "OPENROUTER_MODELS",
+        "meta-llama/llama-3.1-8b-instruct:free,mistralai/mistral-7b-instruct:free"
+    ).split(",") if model.strip()
+]
 STATUS_FILE = "public/status.json"
 EPISODES_DIR = "public/episodes"
 
@@ -89,24 +94,26 @@ def generate_script(news_data):
             print("Google generation failed:", e)
             update_status("Scripting", 48, "Falling back to OpenRouter...")
 
-    # Fallback to OpenRouter if available
+    # Fallback to OpenRouter free models if available
     if OPENROUTER_API_KEY:
         client = OpenAI(
             base_url="https://openrouter.ai/api/v1",
             api_key=OPENROUTER_API_KEY
         )
-        try:
-            response = client.chat.completions.create(
-                model=MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                stream=False
-            )
-            content = response.choices[0].message.content
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0]
-            return json.loads(content)
-        except Exception as e:
-            print(f"OpenRouter generation failed: {e}")
+        for model_name in OPENROUTER_MODELS:
+            try:
+                update_status("Scripting", 52, f"Trying OpenRouter fallback model: {model_name}")
+                response = client.chat.completions.create(
+                    model=model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    stream=False
+                )
+                content = response.choices[0].message.content
+                if "```json" in content:
+                    content = content.split("```json")[1].split("```")[0]
+                return json.loads(content)
+            except Exception as e:
+                print(f"OpenRouter model failed ({model_name}): {e}")
 
     update_status("Scripting", 60, "No LLM available or all models failed. Using fallback static text.")
     return [{"speaker": "Prabhat", "text": "Welcome to IPL Pulse 2026. We had an error generating today's script."}, 
